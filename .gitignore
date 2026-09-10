@@ -1,0 +1,8 @@
+# Downloaded channel playlists + flattened variant cache are regenerated
+# locally, never committed (they roll daily upstream).
+channels/*.m3u
+channels/.flat/
+channels/.refreshed
+
+__pycache__/
+*.pyc

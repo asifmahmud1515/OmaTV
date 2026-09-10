@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "user.oma-tv",
+  "name": "Oma TV",
+  "version": "2.1.0",
+  "author": "DEAN",
+  "description": "IPTV on the taskbar — Roku FAST channels in a popup browser with a shared mpv picture-in-picture player, windowed/fullscreen modes, arrow-key zapping and click-to-resize.",
+  "kinds": [
+    "panel",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "panel": "Panel.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Oma TV",
+    "description": "Free streaming channels in a taskbar popup with a PiP player.",
+    "category": "Media",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

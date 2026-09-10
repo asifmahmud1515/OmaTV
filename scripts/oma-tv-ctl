@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+"""oma-tv-ctl — single-player controller for Oma TV.
+
+Owns one persistent mpv instance (IPC socket), drives its window modes via
+Hyprland (Wayland ignores mpv --geometry), and writes a shared state file the
+taskbar popup and panel poll.
+
+Commands:
+  play <service> <index>   Start channels/<service>.m3u at <index> (PiP).
+  play-url <url> [title]   Start a single URL in the shared player.
+  stop                     Quit mpv and release the window.
+  next | prev              Zap one channel via mpv playlist.
+  mode [cycle|pip|window|fullscreen]
+                           Handle click-to-resize / mode cycling.
+  esc                      Exit fullscreen to windowed, else stop playback.
+  status                   Print JSON playback state (for popup polling).
+
+State file: /tmp/oma-tv-state.json
+"""
+
+import concurrent.futures
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS_DIR = os.path.join(PLUGIN_DIR, "scripts")
+CHANNELS_DIR = os.path.join(PLUGIN_DIR, "channels")
+FLAT_DIR = os.path.join(CHANNELS_DIR, ".flat")
+SOCK = "/tmp/oma-tv-mpv.sock"
+STATE = "/tmp/oma-tv-state.json"
+TITLE = "Oma TV"
+HV = "hyprctl"
+
+PIP_W, PIP_H = 400, 225
+WIN_W, WIN_H = 960, 540
+GAP = 24
+
+# Samsung TV Plus (US master 403, CA segments 403) and Pluto TV (expired,
+# non-renewable shared JWT -> 400) are blocked upstream; Plex FAST works.
+SERVICES = {
+    "roku": {"file": "roku.m3u", "label": "Roku"},
+    "plex": {"file": "plex.m3u", "label": "Plex"},
+}
+
+# Roku masters advertise 6 variants; ffmpeg re-fetches every variant's
+# chunklist to measure bandwidth, ~1s each -> ~20s before first frame.
+# Unfold the master once to a chosen variant and hand mpv a flat playlist.
+MAX_VARIANT_BW = 3500000
+FLAT_WORKERS = 24
+_flatten_inflight = set()
+_flatten_lock = [False]
+
+
+# ------------------------------------------------------- flat variants ----
+
+def service_file(service):
+    return os.path.join(CHANNELS_DIR, SERVICES[service]["file"])
+
+
+def url_at(service, index):
+    with open(service_file(service), "r") as f:
+        for line in f:
+            u = line.strip()
+            if u.startswith(("http://", "https://")):
+                if index == 0:
+                    return u
+                index -= 1
+    return None
+
+
+def url_count(service):
+    n = 0
+    try:
+        with open(service_file(service), "r") as f:
+            for line in f:
+                if line.strip().startswith(("http://", "https://")):
+                    n += 1
+    except Exception:
+        return 0
+    return n
+
+
+def resolve_variant(url):
+    """Unfold a multi-variant HLS master into a single chosen variant URL.
+
+    Returns a flat chunklist URL to skip ffmpeg's bandwidth-measuring probe
+    cycle (the dominant ~1s-per-request delay on slow links), or the original
+    URL when there are no variants / resolution fails.
+    """
+    tmp = None
+    try:
+        import tempfile
+        fd, tmp = tempfile.mkstemp(prefix="oma-flat-", suffix=".m3u8")
+        os.close(fd)
+        p = subprocess.run(
+            ["curl", "-sSL", "--connect-timeout", "10", "--max-time", "20",
+             "-o", tmp, "-w", "%{url_effective}", url],
+            capture_output=True, text=True, timeout=30)
+        if p.returncode != 0:
+            return None
+        eff = (p.stdout or "").strip()
+        with open(tmp, "r", errors="replace") as f:
+            body = f.read()
+        if not body or not eff:
+            return None
+        if "#EXT-X-STREAM-INF" not in body:
+            return url
+        best, best_bw, fallback, fbw = None, -1, None, None
+        lines = body.splitlines()
+        for i, ln in enumerate(lines):
+            if not ln.startswith("#EXT-X-STREAM-INF"):
+                continue
+            bw = 0
+            tag = ln[len("#EXT-X-STREAM-INF:"):]
+            for token in tag.split(","):
+                if token.startswith("BANDWIDTH="):
+                    try:
+                        bw = int(token[len("BANDWIDTH="):])
+                    except ValueError:
+                        bw = 0
+            if bw > 0:
+                if fallback is None or bw < fbw:
+                    fallback, fbw = i, bw
+                if bw <= MAX_VARIANT_BW and bw > best_bw:
+                    best, best_bw = i, bw
+        pick = best if best is not None else fallback
+        target = lines[pick + 1].strip() if pick is not None and pick + 1 < len(lines) else None
+        if not target or target.startswith("#"):
+            return url
+        if target.startswith(("http://", "https://")):
+            return target
+        base = eff.rsplit("/", 1)[0]
+        return base + "/" + target.lstrip("/")
+    except Exception:
+        return None
+
+
+def flat_path(service):
+    return os.path.join(FLAT_DIR, service + ".m3u")
+
+
+def flat_ready(service):
+    f = flat_path(service)
+    src = service_file(service)
+    try:
+        if not os.path.isfile(f):
+            return False
+        return os.path.getmtime(f) >= os.path.getmtime(src)
+    except Exception:
+        return False
+
+
+def flat_build(service, workers=FLAT_WORKERS):
+    """Rewrite channels/<svc>.m3u as a single-variant playlist in .flat/.
+
+    EXTINF lines are preserved byte-for-byte and every URL line is replaced
+    with its flattened variant (kept as-is if it has no variants or fails),
+    so list order / indices line up exactly with the UI.
+    """
+    os.makedirs(FLAT_DIR, exist_ok=True)
+    src = service_file(service)
+    try:
+        with open(src, "r") as f:
+            lines = f.readlines()
+    except Exception:
+        return False
+    jobs = []
+    for i, line in enumerate(lines):
+        u = line.strip()
+        if u.startswith(("http://", "https://")):
+            jobs.append((i, u))
+    resolved = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        fut = {ex.submit(resolve_variant, u): (i, u) for (i, u) in jobs}
+        for f in concurrent.futures.as_completed(fut):
+            i, u = fut[f]
+            try:
+                flat = f.result() or u
+            except Exception:
+                flat = u
+            resolved[i] = flat if flat else u
+    tmp = flat_path(service) + ".tmp"
+    try:
+        with open(tmp, "w") as out:
+            for i, line in enumerate(lines):
+                out.write(resolved.get(i, line.rstrip("\n")) + "\n")
+        os.replace(tmp, flat_path(service))
+        try:
+            os.unlink(flat_lock(service))
+        except FileNotFoundError:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def flat_lock(service):
+    return "/tmp/oma-flat-%s.lck" % service
+
+
+def flat_async(service):
+    """Start a detached flatten worker for <service> (best-effort, once).
+
+    Must be a separate process: each oma-tv-ctl invocation is short-lived, so
+    an in-process thread would be killed before the unfold finishes.
+    """
+    lck = flat_lock(service)
+    try:
+        with open(lck, "r") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return None  # worker still running
+    except (FileNotFoundError, ValueError):
+        pass
+    except ProcessLookupError:
+        try:
+            os.unlink(lck)  # stale lock
+        except FileNotFoundError:
+            pass
+    try:
+        fd = os.open(lck, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return None
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "flatten", service],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    return True
+
+
+# ---------------------------------------------------------------- state ----
+
+def default_state():
+    return {
+        "running": False,
+        "service": "",
+        "playlist": "",
+        "index": 0,
+        "count": 0,
+        "title": "",
+        "mode": "pip",
+        "paused": False,
+        "updated": 0,
+    }
+
+
+def read_state():
+    try:
+        with open(STATE, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return default_state()
+        base = default_state()
+        base.update({k: data[k] for k in data if k in base})
+        return base
+    except Exception:
+        return default_state()
+
+
+def write_state(s):
+    s["updated"] = int(time.time())
+    try:
+        with open(STATE, "w") as f:
+            json.dump(s, f)
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------- helpers ----
+
+def run(cmd, timeout=20):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def mpv_alive():
+    if not os.path.exists(SOCK):
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(SOCK)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+_mpv_request = 0
+
+
+def mpv_send(obj, timeout=4):
+    global _mpv_request
+    _mpv_request += 1
+    obj = dict(obj)
+    obj["request_id"] = _mpv_request
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(SOCK)
+        s.sendall((json.dumps(obj) + "\n").encode())
+        buf = b""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if b"\n" in buf:
+                line = buf.split(b"\n", 1)[0]
+                try:
+                    resp = json.loads(line.decode())
+                    if resp.get("request_id") == _mpv_request:
+                        s.close()
+                        return resp
+                except Exception:
+                    pass
+        s.close()
+        return None
+    except Exception:
+        return None
+
+
+def mpv_cmd(name, *args):
+    resp = mpv_send({"command": [name, *args]})
+    if resp is None or resp.get("error") not in (None, "success"):
+        return None
+    return resp
+
+
+def mpv_get(prop):
+    resp = mpv_send({"command": ["get_property", prop]})
+    return resp.get("data") if resp else None
+
+
+def mpv_launch(extra_args):
+    os.makedirs(os.path.dirname(SOCK) or "/tmp", exist_ok=True)
+    try:
+        os.unlink(SOCK)
+    except FileNotFoundError:
+        pass
+    zap = os.path.join(SCRIPTS_DIR, "mpv-zap.lua")
+    keys = os.path.join(SCRIPTS_DIR, "mpv-keys.conf")
+    args = [
+        "setsid", "mpv",
+        "--idle=yes",
+        "--force-window=yes",
+        "--input-ipc-server=" + SOCK,
+        "--title=" + TITLE,
+        "--loop-playlist=inf",
+        "--cache=yes",
+        "--cache-secs=2",
+        "--demuxer-readahead-secs=2",
+        "--cache-pause=no",
+        "--network-timeout=12",
+        "--no-terminal",
+        "--really-quiet",
+        "--script=" + zap,
+        "--input-conf=" + keys,
+        "--cursor-autohide=1000",
+        "--video-rotate=0",
+        *extra_args,
+    ]
+    subprocess.Popen(args, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    deadline = time.time() + 8
+    while time.time() < deadline and not mpv_alive():
+        time.sleep(0.15)
+    return mpv_alive()
+
+
+def mpv_ready(timeout=8):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if mpv_get("idle-active") is not None:
+            time.sleep(0.3)
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def wait_list_ready(index, timeout=6):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        count = mpv_get("playlist-count")
+        if count and int(count) > index:
+            return
+        time.sleep(0.2)
+
+
+def play_to_file(playlist, index):
+    deadline = time.time() + 6
+    ack = False
+    while time.time() < deadline:
+        if mpv_cmd("loadfile", playlist, "replace") is not None:
+            ack = True
+            break
+        time.sleep(0.2)
+    if ack:
+        wait_list_ready(index)
+        time.sleep(0.3)
+        mpv_cmd("set_property", "pause", False)
+        mpv_cmd("playlist-play-index", int(index))
+    wait_play_ready(index)
+
+
+def wait_play_ready(index, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        pos = mpv_get("playlist-pos")
+        count = mpv_get("playlist-count")
+        if pos == index and count and int(count) > index:
+            return
+        time.sleep(0.15)
+
+
+def wait_video(timeout=24):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if mpv_get("idle-active"):
+            return False
+        w = mpv_get("video-params/w")
+        if isinstance(w, (int, float)) and w > 0:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def play_url(url):
+    mpv_cmd("loadfile", url)
+    time.sleep(0.5)
+    mpv_cmd("set_property", "pause", False)
+
+
+def find_window_addr():
+    rc, out, err = run([HV, "clients", "-j"])
+    if rc != 0:
+        return None
+    try:
+        clients = json.loads(out)
+    except Exception:
+        return None
+    for w in clients:
+        if not isinstance(w, dict):
+            continue
+        t = str(w.get("title", "") or "")
+        c = str(w.get("class", "") or "")
+        if t == TITLE or "mpv" in c.lower():
+            return w.get("address")
+    return None
+
+
+def wait_window(timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        addr = find_window_addr()
+        if addr:
+            return addr
+        time.sleep(0.3)
+    return None
+
+
+def monitor_for(addr, x=None, y=None):
+    rc, out, err = run([HV, "monitors", "-j"])
+    if rc != 0:
+        return {"x": 0, "y": 0, "width": 1366, "height": 768}
+    try:
+        mons = json.loads(out)
+    except Exception:
+        mons = []
+    if not mons:
+        return {"x": 0, "y": 0, "width": 1366, "height": 768}
+
+    if x is not None and y is not None:
+        for m in mons:
+            bx = m.get("x", 0) or 0
+            by = m.get("y", 0) or 0
+            bw = m.get("width", 0) or 0
+            bh = m.get("height", 0) or 0
+            if bx <= x < bx + bw and by <= y < by + bh:
+                return m
+        return mons[0]
+
+    if addr:
+        rc2, out2, _ = run([HV, "clients", "-j"])
+        if rc2 == 0:
+            try:
+                clients = json.loads(out2)
+            except Exception:
+                clients = []
+            for w in clients:
+                if isinstance(w, dict) and w.get("address") == addr:
+                    wx, wy = w.get("at", [0, 0])
+                    ws = w.get("size", [0, 0])
+                    best, best_area = mons[0], -1
+                    for m in mons:
+                        mx, my = m.get("x", 0) or 0, m.get("y", 0) or 0
+                        mw, mh = m.get("width", 0) or 0, m.get("height", 0) or 0
+                        ox = max(0, min(wx + ws[0], mx + mw) - max(wx, mx))
+                        oy = max(0, min(wy + ws[1], my + mh) - max(wy, my))
+                        if ox * oy > best_area:
+                            best, best_area = m, ox * oy
+                    return best
+            return mons[0]
+
+    # No window yet: prefer the focused monitor.
+    try:
+        rc3, out3, _ = run([HV, "activeworkspace", "-j"])
+        if rc3 == 0:
+            ws = json.loads(out3)
+            mid = ws.get("monitorID")
+            for m in mons:
+                if m.get("id") == mid:
+                    return m
+    except Exception:
+        pass
+    return mons[0]
+
+
+def dispatch(lua_expr):
+    rc, out, err = run([HV, "dispatch", lua_expr], timeout=10)
+    return (out or err).strip()
+
+
+def w_float(addr, action):
+    dispatch('hl.dsp.window.float({ action = "%s", window = "address:%s" })'
+             % (action, addr))
+    time.sleep(0.1)
+
+
+def w_pin(addr, action):
+    dispatch('hl.dsp.window.pin({ action = "%s", window = "address:%s" })'
+             % (action, addr))
+    time.sleep(0.1)
+
+
+def w_resize(addr, w, h):
+    dispatch("hl.dsp.window.resize({ x = %d, y = %d, relative = false, window = \"address:%s\" })"
+             % (w, h, addr))
+    time.sleep(0.1)
+
+
+def w_move(addr, x, y):
+    dispatch("hl.dsp.window.move({ x = %d, y = %d, relative = false, window = \"address:%s\" })"
+             % (x, y, addr))
+    time.sleep(0.1)
+
+
+def w_center(addr):
+    dispatch('hl.dsp.window.center({ window = "address:%s" })' % addr)
+    time.sleep(0.15)
+
+
+def w_fullscreen(addr, action):
+    dispatch('hl.dsp.window.fullscreen({ mode = "fullscreen", action = "%s", window = "address:%s" })'
+             % (action, addr))
+    time.sleep(0.3)
+
+
+def w_focus(addr):
+    dispatch('hl.dsp.focus({ window = "address:%s" })' % addr)
+
+
+def mode_pip(addr):
+    mon = monitor_for(addr)
+    w_float(addr, "enable")
+    w_pin(addr, "enable")
+    w_resize(addr, PIP_W, PIP_H)
+    x = mon.get("x", 0) + mon.get("width", 0) - PIP_W - GAP
+    y = mon.get("y", 0) + mon.get("height", 0) - PIP_H - GAP
+    w_move(addr, x, y)
+    w_focus(addr)
+
+
+def mode_windowed(addr, mon=None):
+    if not mon:
+        mon = monitor_for(addr)
+    w_pin(addr, "disable")
+    w_float(addr, "enable")
+    w_resize(addr, WIN_W, WIN_H)
+    x = mon.get("x", 0) + (mon.get("width", 0) - WIN_W) // 2
+    y = mon.get("y", 0) + (mon.get("height", 0) - WIN_H) // 3
+    w_move(addr, x, y)
+    w_focus(addr)
+
+
+def mode_fullscreen(addr):
+    w_float(addr, "disable")
+    w_fullscreen(addr, "set")
+    w_focus(addr)
+
+
+def apply_mode(addr, target):
+    st = read_state()
+    cur = st.get("mode", "pip")
+
+    if target == "cycle":
+        order = ["pip", "window", "fullscreen"]
+        idx = order.index(cur) if cur in order else 0
+        # Clicking out of fullscreen lands back on windowed.
+        target = "window" if cur == "fullscreen" \
+            else order[(idx + 1) % len(order)]
+
+    if cur == "fullscreen" and target != "fullscreen":
+        w_fullscreen(addr, "unset")
+
+    if target == "pip":
+        mode_pip(addr)
+    elif target == "window":
+        mode_windowed(addr)
+    elif target == "fullscreen":
+        mode_fullscreen(addr)
+    else:
+        return st.get("mode", "pip")
+
+    st["mode"] = target
+    write_state(st)
+    return target
+
+
+# ------------------------------------------------------------ commands ----
+
+def cmd_play(args):
+    if len(args) < 2:
+        return error("usage: play <service> <index>")
+    service, index = args[0], int(args[1])
+    info = SERVICES.get(service)
+    if not info:
+        return error("unknown service: %s" % service)
+    src_playlist = service_file(service)
+    if not os.path.isfile(src_playlist):
+        return error("channel list missing: %s (run refresh-channels.sh)" % info["file"])
+    count = url_count(service)
+    index = max(0, min(index, max(count - 1, 0)))
+
+    alive = mpv_alive()
+    if not alive and not mpv_launch([]):
+        return error("mpv failed to start")
+    if not alive and not mpv_ready():
+        return error("mpv not ready")
+
+    addr = wait_window(8)
+    playlist = flat_path(service) if flat_ready(service) else None
+    if playlist:
+        play_to_file(playlist, index)
+    else:
+        # First session on a service: resolve just the played channel to a
+        # single variant (fast), unfold the full list in the background so
+        # zaps get fast too once it's ready.
+        url = resolve_variant(url_at(service, index)) or url_at(service, index)
+        if not url:
+            return error("no channel URL")
+        mpv_cmd("loadfile", url)
+        mpv_cmd("set_property", "pause", False)
+        flat_async(service)
+        playlist = ""
+    vid_ok = wait_video(24)
+
+    st = read_state()
+    st.update(running=vid_ok, service=service, playlist=playlist,
+              index=index, count=count, paused=False)
+    write_state(st)
+
+    if addr:
+        st["mode"] = "pip"
+        write_state(st)
+        mode_pip(addr)
+        time.sleep(0.8)
+        if read_state().get("mode") == "pip" and find_window_addr():
+            mode_pip(find_window_addr())
+    return status_json()
+
+
+def cmd_play_url(args):
+    if len(args) < 1:
+        return error("usage: play-url <url> [title]")
+    url = args[0]
+    title = args[1] if len(args) > 1 else url
+    alive = mpv_alive()
+    if not alive and not mpv_launch([]):
+        return error("mpv failed to start")
+    if not alive and not mpv_ready():
+        return error("mpv not ready")
+
+    addr = wait_window(8)
+    play_url(url)
+
+    st = read_state()
+    st.update(running=True, service="", playlist=url, index=0, title=title,
+              paused=False)
+    write_state(st)
+    if addr:
+        st["mode"] = "pip"
+        write_state(st)
+        mode_pip(addr)
+        time.sleep(0.8)
+        if read_state().get("mode") == "pip" and find_window_addr():
+            mode_pip(find_window_addr())
+    return status_json()
+
+
+def cmd_stop():
+    st = read_state()
+    st.update(running=False, title="", index=0, count=0)
+    write_state(st)
+    if mpv_alive():
+        mpv_cmd("quit")
+        time.sleep(0.5)
+        try:
+            os.unlink(SOCK)
+        except FileNotFoundError:
+            pass
+    return json.dumps(st)
+
+
+def cmd_zap(direction):
+    st = read_state()
+    if not st.get("running") or not mpv_alive():
+        return status_json()
+    service = st.get("service", "")
+    count = url_count(service) or st.get("count", 0) or 0
+    if count <= 0 or not service:
+        return status_json()
+    index = (st.get("index", 0) + direction) % count
+    playlist = flat_path(service) if flat_ready(service) else None
+    if playlist:
+        # Hand the full flat list to mpv if it isn't loaded yet, then zap.
+        if st.get("playlist") != playlist:
+            mpv_cmd("loadfile", playlist, "replace")
+            mpv_cmd("set_property", "pause", False)
+            wait_list_ready(index)
+        mpv_cmd("playlist-play-index", int(index))
+        st["playlist"] = playlist
+    else:
+        # Flat list not ready: resolve the next channel directly.
+        url = resolve_variant(url_at(service, index)) or url_at(service, index)
+        if not url:
+            return status_json()
+        mpv_cmd("loadfile", url)
+        mpv_cmd("set_property", "pause", False)
+    st["index"] = index
+    st["count"] = count
+    write_state(st)
+    time.sleep(0.6)
+    return status_json()
+
+
+def cmd_mode(args):
+    st = read_state()
+    target = args[0] if args else "cycle"
+    if not mpv_alive():
+        return error("no player running")
+    addr = wait_window(6)
+    if not addr:
+        return error("mpv window not found")
+    mode = apply_mode(addr, target)
+    st = read_state()
+    out = dict(st)
+    out["mode"] = mode
+    return json.dumps(out)
+
+
+def cmd_esc():
+    st = read_state()
+    if st.get("mode") == "fullscreen" and mpv_alive():
+        addr = wait_window(6)
+        if addr:
+            mon = monitor_for(addr)
+            w_fullscreen(addr, "unset")
+            mode_windowed(addr, mon)
+            st = read_state()
+            st["mode"] = "window"
+            write_state(st)
+            return json.dumps(st)
+    return cmd_stop()
+
+
+def status_json():
+    st = read_state()
+    if st.get("running") and mpv_alive():
+        # When playing a single-URL placeholder (flat list still unfolding),
+        # mpv's playlist is 1 entry; trust the real list index/count in state.
+        playlist = st.get("playlist", "")
+        if playlist:
+            pos = mpv_get("playlist-pos")
+            count = mpv_get("playlist-count")
+            if pos is not None:
+                st["index"] = int(pos)
+            if count is not None:
+                st["count"] = int(count)
+        paused = mpv_get("pause")
+        title = mpv_get("media-title")
+        if paused is not None:
+            st["paused"] = bool(paused)
+        if title:
+            st["title"] = str(title)
+        write_state(st)
+    elif not st.get("running"):
+        return json.dumps(st)
+    else:
+        st["running"] = False
+        write_state(st)
+    return json.dumps(st)
+
+
+def cmd_pause():
+    st = read_state()
+    if mpv_alive():
+        mpv_cmd("cycle", "pause")
+        time.sleep(0.3)
+        paused = mpv_get("pause")
+        if paused is not None:
+            st["paused"] = bool(paused)
+            write_state(st)
+    return json.dumps(st)
+
+
+def cmd_flatten(args):
+    if len(args) < 1:
+        return error("usage: flatten <service>")
+    service = args[0]
+    if service not in SERVICES:
+        return error("unknown service: %s" % service)
+    if not os.path.isfile(service_file(service)):
+        return error("channel list missing: %s" % service)
+    started = time.time()
+    ok = flat_build(service)
+    dt = time.time() - started
+    return json.dumps({"flatten": service, "ok": ok, "seconds": round(dt, 1)})
+
+
+def cmd_refresh():
+    sh = os.path.join(SCRIPTS_DIR, "refresh-channels.sh")
+    rc, out, err = run([sh], timeout=150)
+    if rc != 0:
+        return error("refresh failed: %s" % (err or out).strip()[:200])
+    return status_json()
+
+
+def error(msg):
+    return json.dumps({"error": msg})
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(error("usage: oma-tv-ctl <command> [args...]"))
+        return 1
+    cmd, args = sys.argv[1], sys.argv[2:]
+    try:
+        out = {
+            "play":     lambda: cmd_play(args),
+            "play-url": lambda: cmd_play_url(args),
+            "stop":     cmd_stop,
+            "next":     lambda: cmd_zap(1),
+            "prev":     lambda: cmd_zap(-1),
+            "mode":     lambda: cmd_mode(args),
+            "esc":      cmd_esc,
+            "pause":    cmd_pause,
+            "refresh":  cmd_refresh,
+            "flatten":  lambda: cmd_flatten(args),
+            "status":   status_json,
+        }.get(cmd)
+        if not out:
+            print(error("unknown command: %s" % cmd))
+            return 1
+        print(out())
+        return 0
+    except KeyboardInterrupt:
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
