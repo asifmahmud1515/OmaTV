@@ -5,15 +5,7 @@ opens a popup to browse Roku channels and plays them in a single shared `mpv`
 window that can be cycled between picture-in-picture, windowed and fullscreen
 modes.
 
-Samsung TV Plus and Pluto TV were dropped upstream / by this plugin:
-
-- **Samsung TV Plus** — US master.m3u8 returns HTTP 403 (Akamai attestation);
-  the Canada master loads but every segment 403s.
-- **Pluto TV** — the shared `samsungtvplus` JWT expires ~1/day upstream and
-  cannot be re-minted client-side; all regions return HTTP 400.
-- **Plex FAST** — plays on a shared Plex token, but only ~10% of its 693
-  channels deliver video; kept at `channels/plex.m3u` as an opt-in
-  (`oma-tv-ctl play plex <i>` after `refresh-channels.sh`).
+Free Roku TV channels are available, you can add your own m3u playlists given by your IPTV providers 
 
 ## Requirements
 
