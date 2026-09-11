@@ -13,6 +13,9 @@ Commands:
   mode [cycle|pip|window|fullscreen]
                            Handle click-to-resize / mode cycling.
   esc                      Exit fullscreen to windowed, else stop playback.
+  add <m3u-url> [name]     Download and register a custom playlist.
+  remove <service-id>      Remove a custom playlist (and cancel playback).
+  services                 List built-in + custom services as JSON.
   status                   Print JSON playback state (for popup polling).
 
 State file: /tmp/oma-tv-state.json
@@ -39,12 +42,40 @@ PIP_W, PIP_H = 400, 225
 WIN_W, WIN_H = 960, 540
 GAP = 24
 
-# Samsung TV Plus (US master 403, CA segments 403) and Pluto TV (expired,
-# non-renewable shared JWT -> 400) are blocked upstream; Plex FAST works.
-SERVICES = {
+# Built-in services. Samsung TV Plus (US master 403, CA segments 403) and
+# Pluto TV (expired, non-renewable shared JWT -> 400) are blocked upstream;
+# Plex FAST works but only ~10% of channels deliver, so it stays as opt-in.
+BUILTIN_SERVICES = {
     "roku": {"file": "roku.m3u", "label": "Roku"},
     "plex": {"file": "plex.m3u", "label": "Plex"},
 }
+
+CUSTOM_DIR = os.path.join(CHANNELS_DIR, "custom")
+CUSTOM_JSON = os.path.join(CHANNELS_DIR, "custom.json")
+
+
+def load_customs():
+    """{id: {"file": "custom/x.m3u", "label": str}} from channels/custom.json."""
+    try:
+        with open(CUSTOM_JSON, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items()
+                    if isinstance(v, dict) and v.get("file")}
+    except Exception:
+        pass
+    return {}
+
+
+def load_services():
+    out = dict(BUILTIN_SERVICES)
+    for sid, info in load_customs().items():
+        out[sid] = {"file": info["file"], "label": info.get("label", sid),
+                    "custom": True}
+    return out
+
+
+SERVICES = load_services()
 
 # Roku masters advertise 6 variants; ffmpeg re-fetches every variant's
 # chunklist to measure bandwidth, ~1s each -> ~20s before first frame.
@@ -73,14 +104,19 @@ def url_at(service, index):
 
 
 def url_count(service):
-    n = 0
     try:
         with open(service_file(service), "r") as f:
-            for line in f:
-                if line.strip().startswith(("http://", "https://")):
-                    n += 1
+            return url_count_file(f)
     except Exception:
         return 0
+
+
+def url_count_file(f):
+    """Count HTTP(S) URL lines in an open file/iterable."""
+    n = 0
+    for line in f:
+        if line.strip().startswith(("http://", "https://")):
+            n += 1
     return n
 
 
@@ -825,7 +861,8 @@ def cmd_pause():
     return json.dumps(st)
 
 
-def cmd_flatten(args):
+def flatten_one(args):
+    """Shared by cmd_flatten and the detached add-worker fallback."""
     if len(args) < 1:
         return error("usage: flatten <service>")
     service = args[0]
@@ -837,6 +874,126 @@ def cmd_flatten(args):
     ok = flat_build(service)
     dt = time.time() - started
     return json.dumps({"flatten": service, "ok": ok, "seconds": round(dt, 1)})
+
+
+def cmd_flatten(args):
+    return flatten_one(args)
+
+
+def slugify(name):
+    out = "".join(c.lower() if c.isalnum() or c in "._-" else "-"
+                  for c in name).strip(".-")
+    return (out or "custom")[:40]
+
+
+def write_customs(customs):
+    tmp = CUSTOM_JSON + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(customs, f, indent=2)
+    os.replace(tmp, CUSTOM_JSON)
+
+
+def cmd_add(args):
+    if len(args) < 1:
+        return error("usage: add <m3u-url> [name]")
+    url = args[0].strip()
+    if not url.startswith(("http://", "https://")):
+        return error("invalid playlist URL (must be http/https)")
+    name = args[1].strip() if len(args) > 1 else ""
+    if not name:
+        name = (url.rsplit("/", 1)[-1].split("?")[0]
+                or url.rstrip("/").rsplit("/", 1)[-1]
+                or "custom playlist")
+    if len(name) > 60:
+        name = name[:60]
+
+    sslug = slugify(name)
+    sid = "custom-" + sslug
+    if sid in load_customs():
+        return error("playlist already added: %s" % sid)
+    os.makedirs(CUSTOM_DIR, exist_ok=True)
+    target = os.path.join(CUSTOM_DIR, sslug + ".m3u")
+
+    rc, out, err = run(["curl", "-fsSL", "--connect-timeout", "15",
+                        "--max-time", "90", "-o", target, url], timeout=110)
+    if rc != 0:
+        try:
+            os.unlink(target)
+        except FileNotFoundError:
+            pass
+        return error("download failed: %s" % (err or out).strip()[:160])
+
+    try:
+        with open(target, "r") as f:
+            n = url_count_file(f)
+    except Exception:
+        n = 0
+    if n <= 0:
+        try:
+            os.unlink(target)
+        except FileNotFoundError:
+            pass
+        return error("not a playlist: no stream URLs found in %s" % url)
+
+    customs = load_customs()
+    customs[sid] = {"file": os.path.join("custom", sslug + ".m3u"),
+                    "label": name}
+    write_customs(customs)
+    custom_flat(sid, sslug + ".m3u")
+    return json.dumps({"id": sid, "label": name, "count": n,
+                       "file": "custom/" + sslug + ".m3u"})
+
+
+def custom_flat(sid, m3u):
+    """Unfold a freshly added custom playlist in the background.
+
+    The worker re-reads channels/custom.json at import, so it already knows
+    this service; the first play resolves just the played channel inline.
+    """
+    flat_async(sid)
+
+
+def cmd_remove(args):
+    if len(args) < 1:
+        return error("usage: remove <service-id>")
+    sid = args[0]
+    customs = load_customs()
+    if sid not in customs:
+        return error("not a custom playlist: %s" % sid)
+    entry = customs[sid]
+    for f in (os.path.join(CHANNELS_DIR, entry["file"]),
+              flat_path(sid), flat_path(sid) + ".tmp"):
+        try:
+            if os.path.isfile(f):
+                os.unlink(f)
+        except Exception:
+            pass
+    try:
+        os.unlink(flat_lock(sid))
+    except (FileNotFoundError, OSError):
+        pass
+    del customs[sid]
+    if customs:
+        write_customs(customs)
+    else:
+        try:
+            os.unlink(CUSTOM_JSON)
+        except FileNotFoundError:
+            pass
+    # Stop playback if it was on this playlist.
+    st = read_state()
+    if st.get("service") == sid:
+        cmd_stop()
+    return json.dumps({"removed": sid})
+
+
+def cmd_services():
+    out = [{"id": sid,
+            "label": info.get("label", sid),
+            "file": info.get("file", ""),
+            "custom": bool(info.get("custom"))}
+           for sid, info in SERVICES.items()]
+    return json.dumps({"services": out})
 
 
 def cmd_refresh():
@@ -868,6 +1025,9 @@ def main():
             "pause":    cmd_pause,
             "refresh":  cmd_refresh,
             "flatten":  lambda: cmd_flatten(args),
+            "add":      lambda: cmd_add(args),
+            "remove":   lambda: cmd_remove(args),
+            "services": cmd_services,
             "status":   status_json,
         }.get(cmd)
         if not out:

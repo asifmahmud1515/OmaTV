@@ -69,10 +69,13 @@ BEGIN { printf "["; sep = ""; count = 0 }
 /^(http|https|rtsp|rtmp|rtmps|udp|mms|file|sttp):\/\// && NF > 0 {
     url = $0
     gsub(/^[ \t]+|[ \t]+$/, "", url)
+    gsub(/\r$/, "", url)
     # Skip if this is a plain text continuation (not a URL)
     if (url !~ /^(http|https|rtsp|rtmp|rtmps|udp|mms|file|sttp):\/\//) next
     if (group == "") group = "Ungrouped"
     if (name == "") name = "Unknown"
+    gsub(/\r$/, "", name)
+    gsub(/\r$/, "", group)
 
     # Escape JSON special characters in name and group
     gsub(/\\/, "\\\\", name)

@@ -17,9 +17,10 @@ BarWidget {
   readonly property string ctlPath: root.localPath(ctlUrl)
   readonly property string parsePath: root.localPath(parseUrl)
 
-  readonly property var services: [
+  readonly property var builtinServices: [
     { id: "roku", label: "Roku", file: "roku.m3u" }
   ]
+  property var services: []
 
   property bool opened: false
   property string activeService: "roku"
@@ -47,6 +48,11 @@ BarWidget {
   property var ctlQueue: []
   property var parseQueue: []
   property bool statusRefreshPending: false
+  property bool addMode: false
+  property string addUrl: ""
+  property string pendingAdd: ""
+  property string pendingRemove: ""
+  property bool svcPending: false
 
   readonly property bool ctlBusy: {
     root.dataRevision
@@ -205,6 +211,103 @@ BarWidget {
     for (var i = 0; i < root.services.length; i++) root.ensureLoaded(root.services[i].id)
   }
 
+  function refreshServices() {
+    if (svcProc.running) {
+      root.svcPending = true
+      return
+    }
+    svcProc.command = [root.ctlPath, "services"]
+    svcProc.running = true
+  }
+
+  function applyServices(list) {
+    if (!Array.isArray(list) || list.length === 0) return
+    var active = root.activeService
+    var found = false
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].id === active) { found = true; break }
+    }
+    if (!found) active = list[0].id
+    root.services = list
+    root.activeService = active
+    root.dataRevision++
+    var info = root.dataFor(root.activeService)
+    root.channels = info.loaded ? info.channels : []
+    root.groups = info.loaded ? info.groups : []
+    root.filterText = ""
+    root.selectedGroup = "All"
+    root.selectedIndex = 0
+    root.applyFilter()
+    for (var k = 0; k < root.services.length; k++) root.ensureLoaded(root.services[k].id)
+  }
+
+  function startAdd() {
+    root.addMode = true
+    root.addUrl = ""
+    root.statusMessage = ""
+    root.statusError = false
+    panelFocus.forceActiveFocus()
+  }
+
+  function cancelAdd() {
+    root.addMode = false
+    root.addUrl = ""
+    panelFocus.forceActiveFocus()
+  }
+
+  function confirmAdd() {
+    var url = root.addUrl.trim()
+    if (url === "") { root.cancelAdd(); return }
+    root.addMode = false
+    root.addUrl = ""
+    root.pendingAdd = url
+    root.statusMessage = "Adding playlist…"
+    root.statusError = false
+    root.runCtl("add", url)
+  }
+
+  function removeService(id) {
+    if (root.ctlBusy || root.pendingRemove !== "" || root.pendingAdd !== "") return
+    root.pendingRemove = id
+    root.statusMessage = "Removing playlist…"
+    root.statusError = false
+    root.runCtl("remove", id)
+  }
+
+  function handleAddRemoveDone() {
+    if (root.pendingAdd !== "") {
+      var url = root.pendingAdd
+      root.pendingAdd = ""
+      if (ctlProc.capturedError !== "") {
+        root.statusMessage = ctlProc.capturedError
+        root.statusError = true
+      } else {
+        root.statusMessage = "Playlist added"
+        root.statusError = false
+        var res = ctlProc.lastResult
+        if (res && res.id) {
+          root.services.push({ id: String(res.id), label: String(res.label || res.id), file: String(res.file || ""), custom: true })
+          root.dataRevision++
+          root.selectService(String(res.id))
+        }
+        root.refreshServices()
+      }
+    }
+    if (root.pendingRemove !== "") {
+      var rid = root.pendingRemove
+      root.pendingRemove = ""
+      if (ctlProc.capturedError !== "") {
+        root.statusMessage = ctlProc.capturedError
+        root.statusError = true
+      } else {
+        root.statusMessage = "Removed playlist"
+        root.statusError = false
+        if (root.activeService === rid) root.activeService = "roku"
+        root.refreshServices()
+      }
+    }
+  }
+
   function togglePause() {
     root.runCtl("pause")
   }
@@ -267,6 +370,7 @@ BarWidget {
     root.filterText = ""
     root.selectedGroup = "All"
     for (var i = 0; i < root.services.length; i++) root.ensureLoaded(root.services[i].id)
+    root.refreshServices()
     Qt.callLater(function() {
       if (root.opened) panelFocus.forceActiveFocus()
     })
@@ -324,6 +428,7 @@ BarWidget {
     id: ctlProc
     command: []
     property string capturedError: ""
+    property var lastResult: ({})
 
     stdout: SplitParser {
       onRead: function(line) {
@@ -331,7 +436,11 @@ BarWidget {
         if (text === "") return
         var parsed
         try { parsed = JSON.parse(text) } catch (e) { return }
-        if (parsed.error) ctlProc.capturedError = String(parsed.error)
+        if (parsed.error) {
+          ctlProc.capturedError = String(parsed.error)
+        } else {
+          ctlProc.lastResult = parsed
+        }
       }
     }
     stderr: SplitParser {
@@ -342,6 +451,7 @@ BarWidget {
     onExited: function(exitCode) {
       Qt.callLater(function() {
         root.refreshing = false
+        root.handleAddRemoveDone()
         if (root.awaitingReload) {
           root.awaitingReload = false
           root.reloadAfterRefresh()
@@ -354,6 +464,35 @@ BarWidget {
         }
         if (root.ctlQueue.length > 0) root.runNextCtl()
         else Qt.callLater(root.refreshStatus)
+      })
+    }
+  }
+
+  Process {
+    id: svcProc
+    command: []
+    property var pendingList: []
+
+    stdout: SplitParser {
+      onRead: function(line) {
+        var text = String(line || "").trim()
+        if (text === "") return
+        var parsed
+        try { parsed = JSON.parse(text) } catch (e) { return }
+        if (parsed && Array.isArray(parsed.services)) {
+          svcProc.pendingList = parsed.services
+        }
+      }
+    }
+    onExited: function() {
+      Qt.callLater(function() {
+        var list = svcProc.pendingList
+        svcProc.pendingList = []
+        if (list && list.length > 0) root.applyServices(list)
+        if (root.svcPending) {
+          root.svcPending = false
+          Qt.callLater(root.refreshServices)
+        }
       })
     }
   }
@@ -383,6 +522,12 @@ BarWidget {
     repeat: true
     triggeredOnStart: true
     onTriggered: root.refreshStatus()
+  }
+
+  Component.onCompleted: {
+    root.services = root.builtinServices.slice()
+    root.dataRevision++
+    root.refreshServices()
   }
 
   BarIconButton {
@@ -421,9 +566,21 @@ BarWidget {
       anchors.fill: parent
       focus: true
 
-      Keys.onEscapePressed: root.close()
+      Keys.onEscapePressed: if (!root.addMode) root.close()
       Keys.onPressed: function(event) {
-        if (event.key === Qt.Key_Up) {
+        if (root.addMode) {
+          if (event.key === Qt.Key_Escape) {
+            root.cancelAdd()
+          } else if (event.key === Qt.Key_Backspace) {
+            root.addUrl = root.addUrl.slice(0, -1)
+          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            root.confirmAdd()
+          } else if (event.text && event.text.length === 1
+                     && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127) {
+            root.addUrl = root.addUrl + event.text
+          }
+          event.accepted = true
+        } else if (event.key === Qt.Key_Up) {
           root.select(-1)
           event.accepted = true
         } else if (event.key === Qt.Key_Down) {
@@ -479,7 +636,7 @@ BarWidget {
                 width: parent.width
                 text: root.running
                   ? root.nowTitle + " · " + root.modeLabel + (root.paused ? " · paused" : "")
-                  : "Samsung TV Plus, Pluto TV & Roku"
+                  : "Free live TV · Roku channels & your own m3u lists"
                 color: Qt.darker(Color.popups.text, 1.45)
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
                 font.pixelSize: Style.font.caption
@@ -551,6 +708,124 @@ BarWidget {
             enabled: !root.ctlBusy
             onChanged: function(value) {
               root.selectService(value)
+            }
+          }
+
+          Button {
+            id: addPlaylistButton
+            width: parent.width
+            height: Style.space(30)
+            text: "\uf067  Add m3u playlist"
+            foreground: Color.popups.text
+            accent: Color.accent
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            enabled: !root.ctlBusy && !root.addMode
+            visible: !root.addMode
+            onClicked: root.startAdd()
+          }
+
+          Rectangle {
+            width: parent.width
+            height: Style.space(34)
+            radius: Style.cornerRadius * 0.8
+            color: Qt.rgba(1, 1, 1, 0.05)
+            visible: root.addMode
+
+            Row {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              spacing: Style.spacing.xs
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                text: "\uf0c1"
+                color: Color.accent
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width - hintText.implicitWidth - parent.spacing - Style.space(16)
+                text: root.addUrl !== "" ? root.addUrl : "Paste an m3u URL…"
+                color: root.addUrl !== "" ? Color.popups.text : Qt.darker(Color.popups.text, 1.4)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+              }
+
+              Text {
+                id: hintText
+                anchors.verticalCenter: parent.verticalCenter
+                text: "↵ add · esc cancel"
+                color: Qt.darker(Color.popups.text, 1.45)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              onClicked: panelFocus.forceActiveFocus()
+            }
+          }
+
+          Flow {
+            width: parent.width
+            spacing: Style.spacing.xs
+            visible: root.customServices.length > 0
+
+            Repeater {
+              model: root.customServices
+
+              Rectangle {
+                required property var modelData
+                height: Style.space(26)
+                width: mgLabel.implicitWidth + mgRemove.implicitWidth + Style.space(20)
+                radius: Style.space(13)
+                color: Qt.rgba(1, 1, 1, 0.06)
+
+                Row {
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(8)
+                  spacing: Style.spacing.xs
+
+                  Text {
+                    id: mgLabel
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: modelData.label
+                    elide: Text.ElideRight
+                    color: Qt.darker(Color.popups.text, 1.15)
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    id: mgRemove
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "\uf00d"
+                    color: root.bar ? root.bar.urgent : Color.urgent
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+
+                    MouseArea {
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.removeService(modelData.id)
+                    }
+                  }
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.selectService(modelData.id)
+                }
+              }
             }
           }
 
@@ -845,6 +1120,15 @@ BarWidget {
         }
       }
     }
+  }
+
+  readonly property var customServices: {
+    root.dataRevision
+    var result = []
+    for (var i = 0; i < root.services.length; i++) {
+      if (root.services[i].custom) result.push(root.services[i])
+    }
+    return result
   }
 
   readonly property var serviceOptions: {

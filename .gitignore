@@ -3,6 +3,8 @@
 channels/*.m3u
 channels/.flat/
 channels/.refreshed
+channels/custom/
+channels/custom.json
 
 __pycache__/
 *.pyc
